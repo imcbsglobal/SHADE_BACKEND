@@ -15,7 +15,7 @@ SECRET_KEY = 'django-insecure-wg+lqh^35d*dbii1dep9=c!00=)(pyjft702j*7c5vh4e!1u84
 
 DEBUG = True
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = ['localhost', '127.0.0.1', '0.0.0.0']
 
 
 # APPLICATIONS
@@ -37,6 +37,7 @@ INSTALLED_APPS = [
     'Login',
     'hospitalsettings',
     'Appointment',
+    'app1.apps.App1Config',
 ]
 
 
@@ -84,7 +85,7 @@ DATABASES = {
         'ENGINE': 'django.db.backends.postgresql',
         'NAME': 'shade_hms_db',
         'USER': 'postgres',
-        'PASSWORD': '12345',
+        'PASSWORD': '12345',                                                           
         'HOST': 'localhost',
         'PORT': '5432',
     }

@@ -1,19 +1,20 @@
 from django.contrib import admin
 from django.urls import path, include
+from app1.views import get_hospital_info
 
 urlpatterns = [
     path('admin/', admin.site.urls),
 
-    # ── Auth ──────────────────────────────────────────────────────────────
+    # Auth
     path('api/auth/', include('Login.urls')),
 
-    # ── Hospital Settings ─────────────────────────────────────────────────
+    # Hospital Settings
     path('api/settings/', include('hospitalsettings.urls')),
 
-    # ── Appointments ──────────────────────────────────────────────────────
-    # GET    /api/appointments/              — list all (admin JWT)
-    # POST   /api/appointments/create/       — create  (admin JWT)
-    # PATCH  /api/appointments/<id>/status/  — update status (admin JWT)
-    # DELETE /api/appointments/<id>/delete/  — delete  (admin JWT)
+    # Appointments
     path('api/appointments/', include('Appointment.urls')),
+
+    # Doctors and Hospital Info
+    path('api/doctors/', include('app1.urls')),
+    path('api/hospital-info/', get_hospital_info, name='get_hospital_info'),
 ]

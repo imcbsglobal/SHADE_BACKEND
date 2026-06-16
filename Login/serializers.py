@@ -2,5 +2,6 @@ from rest_framework import serializers
 
 
 class AdminLoginSerializer(serializers.Serializer):
-    username = serializers.CharField()
-    password = serializers.CharField(write_only=True)
+    username  = serializers.CharField()
+    password  = serializers.CharField(write_only=True)
+    client_id = serializers.CharField()

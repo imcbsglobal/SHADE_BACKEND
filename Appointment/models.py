@@ -28,6 +28,9 @@ class Appointment(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    # Client isolation
+    client_id  = models.CharField(max_length=20, blank=True, default='')
+
     class Meta:
         ordering = ['-created_at']
 
