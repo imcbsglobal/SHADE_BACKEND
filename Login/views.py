@@ -11,16 +11,12 @@ from .serializers import AdminLoginSerializer
 LICENSE_API = 'https://activate.imcbs.com/mobileapp/api/project/shadehms/'
 
 
-def validate_client_id(client_id: str) -> dict | None:
-    """
-    Calls the license server and returns the matching customer dict
-    if client_id is found and Active, otherwise None.
-    """
+def validate_client_id(client_id: str):
+    """Calls the license server; returns the customer dict if valid, else None."""
     try:
         resp = http_requests.get(LICENSE_API, timeout=8)
         resp.raise_for_status()
-        data = resp.json()
-        for customer in data.get('customers', []):
+        for customer in resp.json().get('customers', []):
             if (
                 customer.get('client_id') == client_id
                 and customer.get('status') == 'Active'
@@ -33,14 +29,21 @@ def validate_client_id(client_id: str) -> dict | None:
 
 
 def get_tokens_for_user(user, client_id: str):
-    """Return a fresh access/refresh token pair, embedding client_id in the payload."""
+    """Issue a JWT pair with client_id embedded as a custom claim."""
     refresh = RefreshToken.for_user(user)
-    refresh['client_id'] = client_id          # custom claim — available on every request
-    return {
-        'refresh': str(refresh),
-        'access':  str(refresh.access_token),
-    }
+    refresh['client_id'] = client_id
+    return {'refresh': str(refresh), 'access': str(refresh.access_token)}
 
+
+def _get_client_id(request) -> str:
+    """Extract client_id custom claim from the validated JWT token."""
+    auth = getattr(request, 'auth', None)
+    return (auth.get('client_id') or '') if auth else ''
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ADMIN LOGIN
+# ═══════════════════════════════════════════════════════════════════════════
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
@@ -48,10 +51,6 @@ def admin_login(request):
     """
     POST /api/auth/admin/login/
     Body: { "username": "...", "password": "...", "client_id": "..." }
-
-    1. Validates client_id against the license server.
-    2. Authenticates the Django user.
-    3. Returns JWT tokens with client_id embedded in the payload.
     """
     serializer = AdminLoginSerializer(data=request.data)
     if not serializer.is_valid():
@@ -61,12 +60,8 @@ def admin_login(request):
     password  = serializer.validated_data['password']
     client_id = serializer.validated_data.get('client_id', '').strip()
 
-    # ── 1. Validate client_id ──────────────────────────────────────────────
     if not client_id:
-        return Response(
-            {'detail': 'Client ID is required.'},
-            status=status.HTTP_400_BAD_REQUEST,
-        )
+        return Response({'detail': 'Client ID is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
     customer = validate_client_id(client_id)
     if customer is None:
@@ -75,8 +70,7 @@ def admin_login(request):
             status=status.HTTP_403_FORBIDDEN,
         )
 
-    # ── 2. Authenticate Django user ───────────────────────────────────────
-    # Support login with either username or email
+    # Support login by email or username
     from django.contrib.auth.models import User as DjangoUser
     actual_username = username
     if '@' in username:
@@ -86,28 +80,14 @@ def admin_login(request):
             actual_username = username
 
     user = authenticate(request, username=actual_username, password=password)
-
     if user is None:
-        return Response(
-            {'detail': 'Invalid username or password.'},
-            status=status.HTTP_401_UNAUTHORIZED,
-        )
-
+        return Response({'detail': 'Invalid username or password.'}, status=status.HTTP_401_UNAUTHORIZED)
     if not (user.is_staff or user.is_superuser):
-        return Response(
-            {'detail': 'You do not have admin privileges.'},
-            status=status.HTTP_403_FORBIDDEN,
-        )
-
+        return Response({'detail': 'You do not have admin privileges.'}, status=status.HTTP_403_FORBIDDEN)
     if not user.is_active:
-        return Response(
-            {'detail': 'This account has been deactivated.'},
-            status=status.HTTP_403_FORBIDDEN,
-        )
+        return Response({'detail': 'This account has been deactivated.'}, status=status.HTTP_403_FORBIDDEN)
 
-    # ── 3. Issue tokens ───────────────────────────────────────────────────
     tokens = get_tokens_for_user(user, client_id)
-
     return Response({
         'access_token':  tokens['access'],
         'refresh_token': tokens['refresh'],
@@ -126,53 +106,101 @@ def admin_login(request):
     }, status=status.HTTP_200_OK)
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# DOCTOR LOGIN
+# ═══════════════════════════════════════════════════════════════════════════
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def doctor_login(request):
+    """
+    POST /api/auth/doctor/login/
+    Body: { "email": "...", "password": "..." }
+    Authenticates against DoctorCredential table set by admin.
+    """
+    from django.contrib.auth.hashers import check_password
+    from django.contrib.auth.models import User as DjangoUser
+    from .models import DoctorCredential
+
+    email    = request.data.get('email', '').strip()
+    password = request.data.get('password', '').strip()
+
+    if not email or not password:
+        return Response({'detail': 'Email and password are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        cred = DoctorCredential.objects.get(email__iexact=email)
+    except DoctorCredential.DoesNotExist:
+        return Response({'detail': 'Invalid email or password.'}, status=status.HTTP_401_UNAUTHORIZED)
+    except DoctorCredential.MultipleObjectsReturned:
+        cred = DoctorCredential.objects.filter(email__iexact=email).order_by('-updated_at').first()
+
+    if not check_password(password, cred.password):
+        return Response({'detail': 'Invalid email or password.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+    # Issue JWT using a system user as the token subject
+    system_user = DjangoUser.objects.filter(is_superuser=True).first() \
+               or DjangoUser.objects.first()
+
+    refresh = RefreshToken.for_user(system_user) if system_user else RefreshToken()
+    refresh['doctor_code'] = cred.doctor_code
+    refresh['doctor_name'] = cred.doctor_name
+    refresh['client_id']   = cred.client_id
+    refresh['role']        = 'DOCTOR'
+
+    return Response({
+        'access_token':  str(refresh.access_token),
+        'refresh_token': str(refresh),
+        'doctor_code':   cred.doctor_code,
+        'client_id':     cred.client_id,
+        'user': {
+            'name':        cred.doctor_name,
+            'email':       cred.email,
+            'department':  cred.department,
+            'doctor_code': cred.doctor_code,
+            'role':        'DOCTOR',
+        },
+    }, status=status.HTTP_200_OK)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TOKEN REFRESH & LOGOUT
+# ═══════════════════════════════════════════════════════════════════════════
+
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def token_refresh(request):
-    """
-    POST /api/auth/token/refresh/
-    Body: { "refresh": "<refresh_token>" }
-    """
+    """POST /api/auth/token/refresh/  Body: { "refresh": "..." }"""
     from rest_framework_simplejwt.serializers import TokenRefreshSerializer
     serializer = TokenRefreshSerializer(data=request.data)
     try:
         serializer.is_valid(raise_exception=True)
     except Exception as e:
         return Response({'detail': str(e)}, status=status.HTTP_401_UNAUTHORIZED)
-
     return Response(serializer.validated_data, status=status.HTTP_200_OK)
 
 
 @api_view(['POST'])
 def logout(request):
-    """
-    POST /api/auth/logout/
-    Blacklists the refresh token.
-    """
+    """POST /api/auth/logout/  Blacklists the refresh token."""
     try:
         refresh_token = request.data.get('refresh')
         if refresh_token:
-            token = RefreshToken(refresh_token)
-            token.blacklist()
+            RefreshToken(refresh_token).blacklist()
         return Response({'detail': 'Logged out successfully.'}, status=status.HTTP_200_OK)
     except Exception:
         return Response({'detail': 'Logged out.'}, status=status.HTTP_200_OK)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# DOCTOR CREDENTIALS  — scoped to client_id from JWT
+# DOCTOR CREDENTIALS  (admin JWT required — scoped to client_id)
 # ═══════════════════════════════════════════════════════════════════════════
-
-def _get_client_id(request) -> str:
-    auth = getattr(request, 'auth', None)
-    return (auth.get('client_id') or '') if auth else ''
-
 
 @api_view(['GET', 'POST'])
 def doctor_credentials_list(request):
     """
-    GET  /api/auth/doctor/credentials/  — list all credentials for this client
-    POST /api/auth/doctor/credentials/  — create a new credential
+    GET  /api/auth/doctor/credentials/  — list credentials for this client
+    POST /api/auth/doctor/credentials/  — create credential
     """
     from django.contrib.auth.hashers import make_password
     from .models import DoctorCredential
@@ -181,21 +209,17 @@ def doctor_credentials_list(request):
 
     if request.method == 'GET':
         qs = DoctorCredential.objects.filter(client_id=client_id)
-        data = [
-            {
-                'id':          c.id,
-                'doctor_code': c.doctor_code,
-                'doctor_name': c.doctor_name,
-                'department':  c.department,
-                'email':       c.email,
-                'password':    '',          # never expose the hash
-                'created_at':  c.created_at.isoformat(),
-            }
-            for c in qs
-        ]
-        return Response(data)
+        return Response([{
+            'id':          c.id,
+            'doctor_code': c.doctor_code,
+            'doctor_name': c.doctor_name,
+            'department':  c.department,
+            'email':       c.email,
+            'password':    c.plain_password,
+            'created_at':  c.created_at.isoformat(),
+        } for c in qs])
 
-    # POST — create
+    # POST — create / update
     d = request.data
     doctor_code = d.get('doctor_code', '').strip()
     email       = d.get('email', '').strip()
@@ -207,7 +231,6 @@ def doctor_credentials_list(request):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    # Look up doctor name/dept from hms_doctors if available
     doctor_name = d.get('doctor_name') or d.get('doctorName', '')
     department  = d.get('department', '')
     try:
@@ -222,31 +245,29 @@ def doctor_credentials_list(request):
         doctor_code=doctor_code,
         client_id=client_id,
         defaults={
-            'doctor_name': doctor_name,
-            'department':  department,
-            'email':       email,
-            'password':    make_password(password),
+            'doctor_name':    doctor_name,
+            'department':     department,
+            'email':          email,
+            'password':       make_password(password),
+            'plain_password': password,
         },
     )
-    return Response(
-        {
-            'id':          cred.id,
-            'doctor_code': cred.doctor_code,
-            'doctor_name': cred.doctor_name,
-            'department':  cred.department,
-            'email':       cred.email,
-            'password':    '',
-            'created_at':  cred.created_at.isoformat(),
-        },
-        status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
-    )
+    return Response({
+        'id':          cred.id,
+        'doctor_code': cred.doctor_code,
+        'doctor_name': cred.doctor_name,
+        'department':  cred.department,
+        'email':       cred.email,
+        'password':    cred.plain_password,
+        'created_at':  cred.created_at.isoformat(),
+    }, status=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
 
 
 @api_view(['PATCH', 'DELETE'])
 def doctor_credentials_detail(request, doctor_code):
     """
-    PATCH  /api/auth/doctor/credentials/<doctor_code>/  — update email / password
-    DELETE /api/auth/doctor/credentials/<doctor_code>/  — remove credential
+    PATCH  /api/auth/doctor/credentials/<doctor_code>/
+    DELETE /api/auth/doctor/credentials/<doctor_code>/
     """
     from django.contrib.auth.hashers import make_password
     from .models import DoctorCredential
@@ -262,12 +283,13 @@ def doctor_credentials_detail(request, doctor_code):
         cred.delete()
         return Response({'doctor_code': doctor_code, 'success': True})
 
-    # PATCH
     d = request.data
     if 'email' in d:
         cred.email = d['email'].strip()
     if d.get('password'):
-        cred.password = make_password(d['password'].strip())
+        plain = d['password'].strip()
+        cred.password       = make_password(plain)
+        cred.plain_password = plain
     if 'doctor_name' in d or 'doctorName' in d:
         cred.doctor_name = d.get('doctor_name') or d.get('doctorName', cred.doctor_name)
     if 'department' in d:
@@ -280,6 +302,6 @@ def doctor_credentials_detail(request, doctor_code):
         'doctor_name': cred.doctor_name,
         'department':  cred.department,
         'email':       cred.email,
-        'password':    '',
+        'password':    cred.plain_password,
         'created_at':  cred.created_at.isoformat(),
     })

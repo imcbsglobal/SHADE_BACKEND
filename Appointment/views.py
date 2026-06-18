@@ -4,7 +4,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from datetime import datetime, date, timedelta
 
-from .models import Appointment
+from .models import Appointment, BlockedSlot
 from .serializers import (
     AppointmentSerializer,
     AppointmentCreateSerializer,
@@ -32,15 +32,16 @@ def get_doctor_slots(request):
 
     Generates time slots for a doctor on a given date based on
     their timing windows in hms_doctorstiming, then marks each slot
-    as 'Booked' or 'Vacant' based on existing appointments.
+    as 'Booked', 'Blocked', or 'Vacant' based on existing appointments
+    and admin-blocked slots.
 
     Response: list of slot objects:
     [
       {
-        "slot_number": 1,        ← hms_doctorstiming.slno
+        "slot_number": 1,
         "start_time":  "09:00",
         "end_time":    "09:15",
-        "status":      "Vacant" | "Booked"
+        "status":      "Vacant" | "Booked" | "Blocked"
       },
       ...
     ]
@@ -56,7 +57,6 @@ def get_doctor_slots(request):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    # Validate / parse date
     try:
         appt_date = datetime.strptime(date_str, '%Y-%m-%d').date()
     except ValueError:
@@ -65,7 +65,6 @@ def get_doctor_slots(request):
             status=status.HTTP_400_BAD_REQUEST,
         )
 
-    # Get doctor's average consultation time (minutes); default 15
     try:
         doctor = HmsDoctors.objects.get(code=doctor_code)
         slot_duration = int(doctor.avgcontime or 15)
@@ -75,12 +74,11 @@ def get_doctor_slots(request):
             status=status.HTTP_404_NOT_FOUND,
         )
 
-    # Fetch this doctor's timing windows
     timings = HmsDoctorstiming.objects.filter(code=doctor_code).order_by('slno')
     if not timings.exists():
-        return Response([])  # no timings configured → empty slot list
+        return Response([])
 
-    # Fetch already-booked times for this doctor on this date
+    # Booked appointment times
     booked_times = set(
         Appointment.objects.filter(
             doctor_code=doctor_code,
@@ -88,7 +86,17 @@ def get_doctor_slots(request):
             status__in=['pending', 'accepted'],
         ).values_list('appointment_time', flat=True)
     )
-    # Generate slots for each timing window
+
+    # Admin-blocked times (client-aware)
+    client_id = get_client_id(request)
+    blocked_qs = BlockedSlot.objects.filter(
+        doctor_code=doctor_code,
+        slot_date=appt_date,
+    )
+    if client_id:
+        blocked_qs = blocked_qs.filter(client_id=client_id)
+    blocked_times = set(blocked_qs.values_list('start_time', flat=True))
+
     slots = []
     for t in timings:
         if not t.time1 or not t.time2:
@@ -101,17 +109,173 @@ def get_doctor_slots(request):
             slot_start = current.time()
             slot_end   = (current + timedelta(minutes=slot_duration)).time()
 
-            is_booked = slot_start in booked_times
+            if slot_start in booked_times:
+                slot_status = 'Booked'
+            elif slot_start in blocked_times:
+                slot_status = 'Blocked'
+            else:
+                slot_status = 'Vacant'
 
             slots.append({
                 'slot_number': int(t.slno),
                 'start_time':  slot_start.strftime('%H:%M'),
                 'end_time':    slot_end.strftime('%H:%M'),
-                'status':      'Booked' if is_booked else 'Vacant',
+                'status':      slot_status,
             })
             current += timedelta(minutes=slot_duration)
 
     return Response(slots)
+
+
+# ── Admin: Get blocked slots for a doctor/date ────────────────────────────────
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def get_blocked_slots(request):
+    """
+    GET /api/appointments/blocked-slots/?doctor_code=D001&date=2026-06-16
+    Returns all blocked start_times for that doctor/date.
+    """
+    doctor_code = request.query_params.get('doctor_code', '').strip()
+    date_str    = request.query_params.get('date', '').strip()
+
+    if not doctor_code or not date_str:
+        return Response({'error': 'doctor_code and date are required.'}, status=400)
+
+    try:
+        slot_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+    except ValueError:
+        return Response({'error': 'date must be YYYY-MM-DD.'}, status=400)
+
+    client_id = get_client_id(request)
+    qs = BlockedSlot.objects.filter(doctor_code=doctor_code, slot_date=slot_date)
+    if client_id:
+        qs = qs.filter(client_id=client_id)
+
+    blocked = [b.start_time.strftime('%H:%M') for b in qs]
+    return Response({'blocked_times': blocked})
+
+
+# ── Admin: Apply block/unblock changes ────────────────────────────────────────
+
+@api_view(['POST'])
+@permission_classes([IsAdminUser])
+def apply_slot_changes(request):
+    """
+    POST /api/appointments/blocked-slots/apply/
+    Body: {
+      "doctor_code": "D001",
+      "date": "2026-06-17",
+      "block":   ["09:00", "09:15"],
+      "unblock": ["09:30"]
+    }
+    """
+    doctor_code = request.data.get('doctor_code', '').strip()
+    date_str    = request.data.get('date', '').strip()
+    to_block    = request.data.get('block',   [])
+    to_unblock  = request.data.get('unblock', [])
+
+    if not doctor_code or not date_str:
+        return Response({'error': 'doctor_code and date are required.'}, status=400)
+
+    try:
+        slot_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+    except ValueError:
+        return Response({'error': 'date must be YYYY-MM-DD.'}, status=400)
+
+    client_id = get_client_id(request) or ''
+
+    # Block
+    for t in to_block:
+        try:
+            parsed = datetime.strptime(t, '%H:%M').time()
+            BlockedSlot.objects.get_or_create(
+                doctor_code=doctor_code,
+                slot_date=slot_date,
+                start_time=parsed,
+                client_id=client_id,
+            )
+        except ValueError:
+            pass  # skip malformed times
+
+    # Unblock
+    for t in to_unblock:
+        try:
+            parsed = datetime.strptime(t, '%H:%M').time()
+            BlockedSlot.objects.filter(
+                doctor_code=doctor_code,
+                slot_date=slot_date,
+                start_time=parsed,
+                client_id=client_id,
+            ).delete()
+        except ValueError:
+            pass
+
+    return Response({'success': True})
+
+
+# ── Doctor Dashboard Stats ────────────────────────────────────────────────────
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def doctor_dashboard_stats(request):
+    """
+    GET /api/appointments/doctor-dashboard-stats/
+
+    Returns stats for the logged-in doctor's dashboard:
+    - today's appointments, pending, accepted, recent activity list
+    - today's schedule (appointment_date = today)
+    Reads doctor_code from the JWT claim.
+    """
+    auth        = getattr(request, 'auth', None)
+    doctor_code = (auth.get('doctor_code') if auth else None) or \
+                  request.query_params.get('doctor_code', '').strip()
+
+    if not doctor_code:
+        return Response({'error': 'doctor_code not found in token.'}, status=400)
+
+    today = date.today()
+
+    base_qs   = Appointment.objects.filter(doctor_code=doctor_code)
+    today_qs  = base_qs.filter(appointment_date=today)
+
+    today_total = today_qs.count()
+    pending     = today_qs.filter(status='pending').count()
+    accepted    = today_qs.filter(status='accepted').count()
+
+    # Recent activity — last 6 appointments (any date)
+    recent = base_qs.order_by('-created_at')[:6]
+    recent_list = [
+        {
+            'id':               a.id,
+            'patient_name':     a.patient_name,
+            'doctor_name':      a.doctor_name or a.doctor_code,
+            'appointment_date': a.appointment_date.isoformat(),
+            'appointment_time': a.appointment_time.strftime('%H:%M') if a.appointment_time else '',
+            'status':           a.status,
+        }
+        for a in recent
+    ]
+
+    # Today's schedule — for the table
+    today_schedule = [
+        {
+            'id':               a.id,
+            'patient_name':     a.patient_name,
+            'department_name':  a.department_name or 'General',
+            'appointment_time': a.appointment_time.strftime('%H:%M') if a.appointment_time else '',
+            'status':           a.status,
+        }
+        for a in today_qs.order_by('appointment_time')
+    ]
+
+    return Response({
+        'today_total':    today_total,
+        'pending':        pending,
+        'accepted':       accepted,
+        'recent_activity': recent_list,
+        'today_schedule':  today_schedule,
+    })
 
 
 # ── List + Create ─────────────────────────────────────────────────────────────
@@ -123,12 +287,27 @@ def list_appointments(request):
     GET /api/appointments/
     Returns all appointments ordered by newest first.
     Supports ?status=pending|accepted|rejected filter.
+    Also supports ?doctor=<code> for doctor-scoped access (doctor JWT).
     """
+    from rest_framework_simplejwt.authentication import JWTAuthentication
+
     qs = Appointment.objects.all()
-    # Filter to this client's appointments only
-    client_id = get_client_id(request)
-    if client_id:
-        qs = qs.filter(client_id=client_id)
+
+    # If called with a doctor JWT (non-admin), filter to that doctor's appointments
+    auth = getattr(request, 'auth', None)
+    doctor_code_claim = auth.get('doctor_code') if auth else None
+    if doctor_code_claim:
+        qs = qs.filter(doctor_code=doctor_code_claim)
+    else:
+        # Admin path — filter by client_id
+        client_id = get_client_id(request)
+        if client_id:
+            qs = qs.filter(client_id=client_id)
+        # Allow ?doctor= filter for admin too
+        doc = request.query_params.get('doctor', '').strip()
+        if doc:
+            qs = qs.filter(doctor_code=doc)
+
     s = request.query_params.get('status')
     if s in ('pending', 'accepted', 'rejected'):
         qs = qs.filter(status=s)
@@ -205,6 +384,9 @@ def create_appointment(request):
     if not data.get('appointment_type'):
         data['appointment_type'] = 'Consultation'
 
+    # Public bookings (no status in payload) default to 'accepted' automatically
+    if not data.get('status'):
+        data['status'] = 'accepted'
     serializer = AppointmentCreateSerializer(data=data)
     if not serializer.is_valid():
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -251,4 +433,117 @@ def delete_appointment(request, pk):
 
     appointment.delete()
     return Response({'id': pk, 'success': True}, status=status.HTTP_200_OK)
+
+
+# ── Dashboard Stats ───────────────────────────────────────────────────────────
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def dashboard_stats(request):
+    """
+    GET /api/appointments/dashboard-stats/
+
+    Returns all data needed to render the admin dashboard in one call:
+    - Metric counters (doctors, total, today, accepted, pending, rejected)
+    - Last 6 appointments for the activity feed (with doctor_name)
+    - Weekly trend (last 7 days) — per-day totals, accepted, pending
+    - Monthly trend (last 6 months) — per-month totals, accepted, pending
+
+    All counts are scoped to the client_id from the JWT.
+    """
+    from app1.models import HmsDoctors
+    from django.db.models import Count
+    from django.db.models.functions import TruncDate, TruncMonth
+
+    client_id = get_client_id(request)
+
+    # ── Base queryset ─────────────────────────────────────────────────────
+    qs = Appointment.objects.all()
+    if client_id:
+        qs = qs.filter(client_id=client_id)
+
+    today = date.today()
+
+    # ── Metric counts ─────────────────────────────────────────────────────
+    total_apts   = qs.count()
+    today_apts   = qs.filter(appointment_date=today).count()
+    accepted     = qs.filter(status='accepted').count()
+    pending      = qs.filter(status='pending').count()
+    rejected     = qs.filter(status='rejected').count()
+
+    # Doctor count (client-scoped)
+    doc_qs = HmsDoctors.objects.all()
+    if client_id:
+        doc_qs = doc_qs.filter(client_id=client_id)
+    total_doctors = doc_qs.count()
+
+    # ── Recent activity — last 6 appointments ────────────────────────────
+    recent = qs.order_by('-created_at')[:6]
+    recent_list = [
+        {
+            'id':               a.id,
+            'patient_name':     a.patient_name,
+            'doctor_name':      a.doctor_name or a.doctor_code,
+            'appointment_date': a.appointment_date.isoformat(),
+            'status':           a.status,
+        }
+        for a in recent
+    ]
+
+    # ── Weekly trend — last 7 calendar days ──────────────────────────────
+    week_start = today - timedelta(days=6)
+    week_qs    = qs.filter(appointment_date__gte=week_start)
+
+    # Build a dict: date_str → {total, accepted, pending}
+    week_map = {}
+    for i in range(7):
+        d = week_start + timedelta(days=i)
+        week_map[d.isoformat()] = {'day': d.strftime('%a'), 'appointments': 0, 'completed': 0, 'pending': 0}
+
+    for a in week_qs.values('appointment_date', 'status'):
+        key = a['appointment_date'].isoformat() if hasattr(a['appointment_date'], 'isoformat') else str(a['appointment_date'])
+        if key in week_map:
+            week_map[key]['appointments'] += 1
+            if a['status'] == 'accepted':
+                week_map[key]['completed'] += 1
+            elif a['status'] == 'pending':
+                week_map[key]['pending'] += 1
+
+    weekly_trend = list(week_map.values())
+
+    # ── Monthly trend — last 6 months ─────────────────────────────────────
+    month_start = (today.replace(day=1) - timedelta(days=150)).replace(day=1)
+    month_qs    = qs.filter(appointment_date__gte=month_start)
+
+    month_map = {}
+    for i in range(6):
+        # Build month keys going back 5 months from current
+        m_date = (today.replace(day=1) - timedelta(days=30 * (5 - i)))
+        key = m_date.strftime('%Y-%m')
+        month_map[key] = {'month': m_date.strftime('%b'), 'appointments': 0, 'completed': 0, 'pending': 0}
+
+    for a in month_qs.values('appointment_date', 'status'):
+        key = a['appointment_date'].strftime('%Y-%m') if hasattr(a['appointment_date'], 'strftime') else str(a['appointment_date'])[:7]
+        if key in month_map:
+            month_map[key]['appointments'] += 1
+            if a['status'] == 'accepted':
+                month_map[key]['completed'] += 1
+            elif a['status'] == 'pending':
+                month_map[key]['pending'] += 1
+
+    monthly_trend = list(month_map.values())
+
+    return Response({
+        'metrics': {
+            'total_doctors':   total_doctors,
+            'total_apts':      total_apts,
+            'today_apts':      today_apts,
+            'accepted':        accepted,
+            'pending':         pending,
+            'rejected':        rejected,
+        },
+        'recent_activity': recent_list,
+        'weekly_trend':    weekly_trend,
+        'monthly_trend':   monthly_trend,
+    })
 

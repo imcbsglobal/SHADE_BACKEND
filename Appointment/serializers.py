@@ -28,4 +28,4 @@ class AppointmentCreateSerializer(serializers.ModelSerializer):
 
 
 class AppointmentStatusSerializer(serializers.Serializer):
-    status = serializers.ChoiceField(choices=['pending', 'accepted', 'rejected'])
+    status = serializers.ChoiceField(choices=['accepted', 'rejected'])
